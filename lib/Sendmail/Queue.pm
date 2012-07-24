@@ -4,13 +4,19 @@ use warnings;
 use Carp;
 use 5.8.0;
 
-our $VERSION = '0.400';
+our $VERSION = '0.600';
 
 use Sendmail::Queue::Qf;
 use Sendmail::Queue::Df;
 use File::Spec;
 use IO::Handle;
-use Fcntl;
+use Fcntl qw( :flock );
+use File::Temp qw(tempfile);
+my $fcntl_struct = 's H60';
+my $fcntl_structlockp = pack($fcntl_struct, Fcntl::F_WRLCK,
+        "000000000000000000000000000000000000000000000000000000000000");
+my $fcntl_structunlockp = pack($fcntl_struct, Fcntl::F_UNLCK,
+        "000000000000000000000000000000000000000000000000000000000000");
 
 use Sendmail::Queue::Base;
 our @ISA = qw( Sendmail::Queue::Base );
@@ -130,6 +136,8 @@ sub new
 
 	my $self = { queue_directory => $args->{queue_directory}, };
 
+	$self->{lock_both} = 0;
+
 	bless $self, $class;
 
 	if(!-d $self->{queue_directory}) {
@@ -148,6 +156,17 @@ sub new
 		$self->set_df_directory(File::Spec->catfile($self->{queue_directory}));
 	}
 
+	# Check if both fcntl-style and flock-style locking is available
+	my ($fh, $filename) = tempfile();
+	if ($fh) {
+		my $flock_status = flock($fh, LOCK_EX | LOCK_NB);
+		my $fcntl_status = fcntl($fh, Fcntl::F_SETLK, $fcntl_structlockp);
+		if ($flock_status && $fcntl_status) {
+			$self->{lock_both} = 1;
+		}
+		$fh->close();
+	}
+	unlink($filename) if $filename;
 	return $self;
 }
 
@@ -413,7 +432,7 @@ sub queue_multiple
 
 			$cur_qf->set_sender( $sender );
 			$cur_qf->add_recipient( @{ $env_data->{recipients} } );
-			$cur_qf->create_and_lock();
+			$cur_qf->create_and_lock($self->{lock_both});
 
 			# As soon as it's created, put it on the list so it can
 			# be cleaned up later if necessary.
@@ -435,7 +454,21 @@ sub queue_multiple
 				$first_df->write();
 			} else {
 				# Otherwise, link to the first df
-				$cur_df->hardlink_to( $first_df->get_data_filename() );
+				eval { $cur_df->hardlink_to( $first_df->get_data_filename() ); };
+				if ($@) {
+					if ($@ =~ /Path .* does not exist/) {
+						# This should NEVER happen...
+						# but it was observed to happen!
+						# Sorry to spew to STDERR, but there's no
+						# feasible way to log this
+						print STDERR 'Sendmail::Queue warning: ' . $first_df->get_data_filename() . ' has disappeared!  Writing new file as ' . $cur_df->get_data_filename() . "\n";
+						$first_df = $cur_df;
+						$first_df->set_data($data);
+						$first_df->write();
+					} else {
+						die($@);
+					}
+				}
 			}
 
 			$results{ $env_name } = $cur_qf->get_queue_id;
@@ -481,7 +514,7 @@ sub sync
 	# TODO: this needs testing on solaris and bsd
 	my $directory = $self->get_df_directory();
 
-	sysopen(DIR_FH, $directory, O_RDONLY) or die qq{Couldn't sysopen $directory: $!};
+	sysopen(DIR_FH, $directory, Fcntl::O_RDONLY) or die qq{Couldn't sysopen $directory: $!};
 
 	my $handle = IO::Handle->new();
 	$handle->fdopen(fileno(DIR_FH), 'w') or die qq{Couldn't fdopen the directory handle: $!};
