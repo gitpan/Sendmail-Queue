@@ -29,4 +29,4 @@ requires:
   perl: 5.8.0
 resources:
   license: http://opensource.org/licenses/gpl-license.php
-version: 0.600
+version: 0.700
